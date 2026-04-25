@@ -22,85 +22,63 @@
     "name": "Criar API Key",
     "url": "https://app.voop.work/dashboard"
   },
-  "anchors": [
-    {
-      "name": "API Reference",
-      "icon": "code",
-      "url": "api-reference"
-    },
-    {
-      "name": "Receitas",
-      "icon": "book",
-      "url": "recipes"
-    }
-  ],
-  "navigation": [
-    {
-      "group": "Começando",
-      "pages": [
-        "introduction",
-        "authentication",
-        "rate-limits",
-        "errors",
-        "idempotency"
-      ]
-    },
-    {
-      "group": "Conceitos",
-      "pages": [
-        "concepts/items",
-        "concepts/media",
-        "concepts/webhooks",
-        "concepts/bulk-import"
-      ]
-    },
-    {
-      "group": "API Reference",
-      "pages": [
-        "api-reference/introduction",
+  "navigation": {
+    "global": {
+      "anchors": [
         {
-          "group": "Items",
-          "pages": [
-            "api-reference/items/upsert",
-            "api-reference/items/bulk-upsert",
-            "api-reference/items/list",
-            "api-reference/items/get",
-            "api-reference/items/delete"
-          ]
-        },
-        {
-          "group": "Bulk Imports",
-          "pages": [
-            "api-reference/imports/initiate",
-            "api-reference/imports/start",
-            "api-reference/imports/get-status",
-            "api-reference/imports/list-errors",
-            "api-reference/imports/cancel"
-          ]
-        },
-        {
-          "group": "Webhooks",
-          "pages": [
-            "api-reference/webhooks/list",
-            "api-reference/webhooks/create",
-            "api-reference/webhooks/delete",
-            "api-reference/webhooks/test",
-            "api-reference/webhooks/list-deliveries"
-          ]
+          "anchor": "Receitas",
+          "icon": "book",
+          "href": "recipes/initial-load-100k"
         }
       ]
     },
-    {
-      "group": "Receitas",
-      "pages": [
-        "recipes/initial-load-100k",
-        "recipes/incremental-sync",
-        "recipes/handle-webhooks",
-        "recipes/erp-integration"
-      ]
-    }
-  ],
-  "openapi": "https://api.voop.work/api/v1/catalog/openapi.json",
+    "tabs": [
+      {
+        "tab": "Guias",
+        "groups": [
+          {
+            "group": "Começando",
+            "pages": [
+              "introduction",
+              "authentication",
+              "rate-limits",
+              "errors",
+              "idempotency"
+            ]
+          },
+          {
+            "group": "Conceitos",
+            "pages": [
+              "concepts/items",
+              "concepts/media",
+              "concepts/webhooks",
+              "concepts/bulk-import"
+            ]
+          },
+          {
+            "group": "Receitas",
+            "pages": [
+              "recipes/initial-load-100k",
+              "recipes/incremental-sync",
+              "recipes/handle-webhooks",
+              "recipes/erp-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Visão geral",
+            "pages": [
+              "api-reference/introduction"
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "footerSocials": {
     "website": "https://voop.work"
   },
