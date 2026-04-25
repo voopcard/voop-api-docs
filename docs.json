@@ -28,7 +28,7 @@
         {
           "anchor": "Receitas",
           "icon": "book",
-          "href": "recipes/initial-load-100k"
+          "href": "/recipes/initial-load-100k"
         }
       ]
     },
