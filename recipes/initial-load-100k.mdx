@@ -1,0 +1,153 @@
+---
+title: "Carga inicial de 100k produtos"
+description: "Receita end-to-end para migrar um catálogo grande para a Voop"
+---
+
+Esta receita cobre o caso real: você tem 100.000 produtos com 300.000 imagens
+no seu sistema e precisa carregar tudo na Voop pela primeira vez.
+
+## Estimativas
+
+- **Metadados**: ~5-10 minutos para 100k items (depende de DB load)
+- **Imagens**: ~30-60 minutos para 300k imagens (limitado por per-domain semaphore)
+- **Total**: ~1 hora; produtos ficam consultáveis em ~10min, imagens chegam após
+
+## Pré-requisitos
+
+- API key com escopos `catalog:write`, `bulk_import:manage`
+- Suas imagens hospedadas em URL pública (CDN, S3 público, etc.)
+- Espaço em disco para gerar o JSONL
+
+## Passo 1: gere o JSONL
+
+Idealmente, declare suas categorias e brands antecipadamente no dashboard. Caso
+contrário, a Voop cria automaticamente conforme aparecem.
+
+```js
+import { createWriteStream } from 'fs';
+import { db } from './seu-db.js';
+
+const stream = createWriteStream('voop-import.jsonl');
+
+for await (const p of db.iterateProducts()) {
+  const line = {
+    externalSystem: 'meu-erp',
+    externalId: p.id,
+    sku: p.sku,
+    name: p.name,
+    description: p.descriptionHtml,
+    price: p.price,
+    cost: p.cost,
+    weight: p.weightKg,
+    gtin13: p.ean,
+    ncm: p.ncm,
+    category: { name: p.categoryName },
+    brand:    p.brandName ? { name: p.brandName } : undefined,
+    tags: p.tags,
+    metadata: { supplierId: p.supplierId },
+    media: p.images.map((img, i) => ({
+      url: img.publicUrl,
+      role: i === 0 ? 'primary' : 'gallery',
+      sortOrder: i,
+    })),
+  };
+  stream.write(JSON.stringify(line) + '\n');
+}
+stream.end();
+console.log('Done — voop-import.jsonl');
+```
+
+<Tip>
+  Para 100k items, o arquivo gera em ~30s e fica entre **30-80 MB** (bem abaixo do
+  limite de 100 MB). Se passar, divida em 2-3 jobs.
+</Tip>
+
+## Passo 2: inicie o job
+
+```bash
+JOB=$(curl -sX POST https://api.voop.work/api/v1/catalog/imports \
+  -H "Authorization: Bearer $VOOP_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{ \"fileSizeBytes\": $(stat -c%s voop-import.jsonl) }")
+
+JOB_ID=$(echo $JOB | jq -r .data.jobId)
+UPLOAD_URL=$(echo $JOB | jq -r .data.uploadUrl)
+
+echo "Job: $JOB_ID"
+```
+
+## Passo 3: faça upload do JSONL
+
+```bash
+curl -X PUT "$UPLOAD_URL" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary @voop-import.jsonl
+```
+
+## Passo 4: dispare o processamento
+
+```bash
+curl -X POST https://api.voop.work/api/v1/catalog/imports/$JOB_ID/start \
+  -H "Authorization: Bearer $VOOP_KEY"
+```
+
+## Passo 5: poll de status
+
+```bash
+while true; do
+  STATUS=$(curl -s https://api.voop.work/api/v1/catalog/imports/$JOB_ID \
+    -H "Authorization: Bearer $VOOP_KEY" | jq -r .data.status)
+  PROGRESS=$(curl -s https://api.voop.work/api/v1/catalog/imports/$JOB_ID \
+    -H "Authorization: Bearer $VOOP_KEY" | jq -r .data.progress)
+  echo "[$STATUS] $PROGRESS%"
+  case $STATUS in
+    completed|completed_with_errors|failed|cancelled) break ;;
+  esac
+  sleep 10
+done
+```
+
+Ou configure um webhook `import.completed` antes de chamar `start`.
+
+## Passo 6: revise os erros
+
+Se `status === "completed_with_errors"`:
+
+```bash
+curl https://api.voop.work/api/v1/catalog/imports/$JOB_ID/errors \
+  -H "Authorization: Bearer $VOOP_KEY" | jq
+```
+
+Para cada erro, você verá:
+- `lineNumber` — qual linha do seu JSONL
+- `externalId` — qual produto (se extraído antes do erro)
+- `errorType` — `validation` (campo inválido), `conflict` (SKU duplicado), `database`
+- `errorMessage` — descrição
+- `rawLine` — primeiras 4kb do JSON original (para debug)
+
+Corrija seu gerador, gere um JSONL **só com os items que falharam**, e re-importe —
+itens que já entraram retornarão `unchanged` (zero impacto).
+
+## Passo 7: monitore a ingest de imagens
+
+Os items ficam consultáveis na API e na IA **imediatamente** após o import dos
+metadados — antes mesmo das imagens chegarem.
+
+Para monitorar imagens, configure um webhook subscrito a `media.ingested` e
+`media.ingestion_failed`. Em ~30-60 minutos a fila normalmente esgota.
+
+Se uma imagem falha (CDN cliente offline, URL quebrada), o evento
+`media.ingestion_failed` te avisa com o motivo.
+
+## Passo 8 (opcional): re-sync periódico
+
+Configure um cron diário para re-importar o catálogo inteiro. Graças ao
+`contentHash`, apenas itens que mudaram serão tocados — o resto retorna
+`unchanged` em milissegundos.
+
+```bash
+# crontab
+0 3 * * *  /opt/voop-sync/run-import.sh
+```
+
+Não precisa fazer diff manual — o backend faz por você.

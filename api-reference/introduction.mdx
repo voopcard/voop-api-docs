@@ -1,0 +1,46 @@
+---
+title: "API Reference"
+description: "Referência interativa gerada da spec OpenAPI"
+---
+
+Toda a referência abaixo é **gerada automaticamente** da spec OpenAPI 3.1
+publicada em:
+
+```
+GET https://api.voop.work/api/v1/catalog/openapi.json
+```
+
+A spec é a fonte de verdade — se algo aqui parecer divergir do comportamento real,
+sempre cheque a spec ao vivo.
+
+## Base URL
+
+| Ambiente | Base URL |
+|---|---|
+| Produção | `https://api.voop.work/api/v1/catalog` |
+| Staging  | `https://staging-api.voop.work/api/v1/catalog` |
+
+## Autenticação
+
+Todas as rotas (exceto `GET /openapi.json`) exigem:
+
+```
+Authorization: Bearer vpk_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+## Geração de SDKs
+
+Use a spec OpenAPI para gerar SDKs em qualquer linguagem:
+
+```bash
+# TypeScript
+npx openapi-typescript-codegen --input https://api.voop.work/api/v1/catalog/openapi.json --output ./src/voop-sdk
+
+# Python
+openapi-generator-cli generate -i https://api.voop.work/api/v1/catalog/openapi.json -g python -o ./voop_sdk
+
+# Go
+openapi-generator-cli generate -i https://api.voop.work/api/v1/catalog/openapi.json -g go -o ./voop-go-sdk
+```
+
+Ou use ferramentas mais modernas como `openapi-fetch`, `kiota`, ou `speakeasy`.

@@ -1,0 +1,133 @@
+---
+title: "Sync incremental contínuo"
+description: "Mantenha o catálogo Voop sempre em dia com mudanças no seu sistema"
+---
+
+Após a [carga inicial](/recipes/initial-load-100k), você quer que mudanças no seu
+sistema reflitam **em segundos** na Voop. Existem duas estratégias.
+
+## Estratégia A: push em cada mudança (recomendada)
+
+Quando um produto é alterado no seu sistema, dispare imediatamente um
+`POST /items/upsert`.
+
+### Exemplo: webhook do Shopify → Voop
+
+```js
+import express from 'express';
+import { createHmac } from 'crypto';
+
+const app = express();
+
+app.post('/shopify/products', express.raw({ type: 'application/json' }), async (req, res) => {
+  // 1. valida assinatura Shopify (omitido)
+  const product = JSON.parse(req.body);
+
+  // 2. transforma para o schema da Voop
+  const voopPayload = {
+    externalSystem: 'shopify',
+    externalId: String(product.id),
+    sku: product.variants[0]?.sku ?? `shopify-${product.id}`,
+    name: product.title,
+    description: product.body_html,
+    price: parseFloat(product.variants[0]?.price ?? '0'),
+    tags: product.tags?.split(', ') ?? [],
+    media: product.images.map((img, i) => ({
+      url: img.src,
+      role: i === 0 ? 'primary' : 'gallery',
+      sortOrder: i,
+    })),
+  };
+
+  // 3. push para Voop (idempotente)
+  await fetch('https://api.voop.work/api/v1/catalog/items/upsert', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.VOOP_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(voopPayload),
+  });
+
+  res.sendStatus(200);
+});
+```
+
+<Note>
+  O endpoint Voop é **idempotente** — se o Shopify reentregar o mesmo webhook
+  (timeout no seu lado), a 2ª chamada retorna `unchanged` sem efeito colateral.
+</Note>
+
+### Tratamento de erros
+
+```js
+const r = await fetch('.../items/upsert', { ... });
+if (r.status === 429) {
+  const retry = parseInt(r.headers.get('retry-after') ?? '5', 10);
+  // re-enfileira para depois
+  await sleep(retry * 1000);
+  // retry...
+}
+if (r.status >= 500) {
+  // erro temporário Voop — retry com backoff exponencial
+}
+if (r.status === 400 || r.status === 409) {
+  // payload inválido — alerta o time de integração
+}
+```
+
+## Estratégia B: re-sync diário com bulk-upsert
+
+Se seu sistema não tem webhooks (ou se os webhooks são pouco confiáveis),
+rode um cron diário que **re-envia o catálogo inteiro** via bulk-upsert.
+
+```js
+// cron: 0 3 * * *
+const products = await db.fetchAllProducts();
+
+for (const chunk of chunks(products, 500)) {
+  const items = chunk.map(transformToVoopFormat);
+  const r = await fetch('https://api.voop.work/api/v1/catalog/items/bulk-upsert', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${VOOP_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+  const { data } = await r.json();
+  console.log(`+${data.summary.created} ~${data.summary.updated} =${data.summary.unchanged} ✗${data.summary.failed}`);
+}
+```
+
+Graças ao `contentHash`, **só os items que mudaram geram writes**. O resto é
+`unchanged` em milissegundos. Para 100k items que não mudaram, o re-sync inteiro
+roda em ~5min e consome ~200 requests.
+
+## Tratamento de exclusões
+
+Tanto na estratégia A quanto B, **a Voop não sabe quando você deletou um produto** —
+o produto simplesmente para de aparecer no seu catálogo.
+
+Solução: junto com o re-sync, mande explicitamente DELETE para os items removidos:
+
+```js
+// Diff: items na Voop mas NÃO no seu sistema → deletar
+const voopItems = await listAllVoopItems(); // GET /items com cursor pagination
+const localIds = new Set(products.map(p => String(p.id)));
+
+for (const v of voopItems) {
+  if (!localIds.has(v.externalId)) {
+    await fetch(`https://api.voop.work/api/v1/catalog/items/shopify/${v.externalId}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${VOOP_KEY}` },
+    });
+  }
+}
+```
+
+Ou, no Shopify, subscreva `products/delete` webhook → DELETE direto na Voop.
+
+## Combinando A + B
+
+Recomendado: **A para mudanças em tempo real**, **B como reconciliação noturna**.
+
+A captura mudanças em segundos. B garante que nenhuma divergência acumula —
+se um webhook foi perdido (rede, deploy, downtime), o B corrige na noite seguinte.

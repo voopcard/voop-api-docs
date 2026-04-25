@@ -1,0 +1,135 @@
+---
+title: "Integração com ERP genérico"
+description: "Padrão para conectar TOTVS, Bling, Tiny, ERP custom à Voop"
+---
+
+ERPs brasileiros (TOTVS Protheus, Bling, Tiny, sistemas próprios) raramente têm
+webhooks confiáveis. A receita abaixo combina **polling com diff por contentHash**
+e o re-sync diário noturno.
+
+## Arquitetura
+
+```
+ERP ──polling──▶ Middleware (Cloud Run / Lambda)
+                  │
+                  ├─ extrai produtos modificados nas últimas 5 min
+                  ├─ transforma para schema Voop
+                  └─ POST /api/v1/catalog/items/bulk-upsert
+```
+
+## Job de polling (a cada 5 min)
+
+```js
+import { Pool } from 'pg';
+
+const pg = new Pool({ /* ... */ });
+
+async function pollAndSync() {
+  // 1. Pega produtos alterados nos últimos 5 minutos
+  const { rows } = await pg.query(`
+    SELECT id, sku, descricao, preco, ncm, peso, ean,
+           categoria, marca, imagens, atualizado_em
+      FROM produtos
+     WHERE atualizado_em > now() - interval '5 minutes'
+     ORDER BY atualizado_em
+  `);
+
+  if (rows.length === 0) return;
+
+  // 2. Transforma em chunks de 500
+  for (const chunk of chunks(rows, 500)) {
+    const items = chunk.map((r) => ({
+      externalSystem: 'totvs',
+      externalId: String(r.id),
+      sku: r.sku,
+      name: r.descricao,
+      price: parseFloat(r.preco),
+      gtin13: r.ean,
+      ncm: r.ncm,
+      weight: parseFloat(r.peso),
+      category: r.categoria ? { name: r.categoria } : undefined,
+      brand: r.marca ? { name: r.marca } : undefined,
+      media: (r.imagens ?? []).map((url, i) => ({
+        url,
+        role: i === 0 ? 'primary' : 'gallery',
+        sortOrder: i,
+      })),
+    }));
+
+    const r = await fetch('https://api.voop.work/api/v1/catalog/items/bulk-upsert', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.VOOP_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ items }),
+    });
+
+    if (!r.ok) {
+      console.error('Voop returned', r.status, await r.text());
+      throw new Error(`Voop sync failed: ${r.status}`);
+    }
+
+    const { data } = await r.json();
+    console.log(`✓ ${data.summary.created}c ${data.summary.updated}u ${data.summary.unchanged}= ${data.summary.failed}✗`);
+  }
+}
+
+// Cron a cada 5min
+setInterval(() => pollAndSync().catch(console.error), 5 * 60 * 1000);
+```
+
+<Tip>
+  Como o backend Voop é idempotente, **não precisa rastrear** o que já foi enviado.
+  Items que não mudaram retornam `unchanged` em milissegundos.
+</Tip>
+
+## Re-sync diário (defesa em profundidade)
+
+Mesmo com polling, agendamentos podem falhar. Toda noite às 3h, faça um re-sync
+**completo** do catálogo via bulk import:
+
+```js
+// Job: 0 3 * * *
+import { createWriteStream } from 'fs';
+import { execSync } from 'child_process';
+
+async function nightlyResync() {
+  const stream = createWriteStream('/tmp/voop-resync.jsonl');
+  const cursor = pg.query(/* ... SELECT * FROM produtos */).cursor();
+
+  for await (const r of cursor) {
+    stream.write(JSON.stringify({ /* mesma transformação */ }) + '\n');
+  }
+  stream.end();
+
+  // Delegar resto ao bulk import (assíncrono)
+  // ... initiate, upload, start (ver receita "carga inicial 100k")
+}
+```
+
+Items que não mudaram entre o polling e o nightly serão `unchanged` — zero overhead.
+
+## Tratamento de exclusões
+
+ERPs raramente "deletam" produtos — eles marcam `inativo=true`. Estratégia:
+
+```js
+// Items inativos no ERP → status="archived" na Voop (não delete)
+const items = rows.map(r => ({
+  ...transformProduct(r),
+  status: r.inativo ? 'archived' : 'active',
+}));
+```
+
+Items `archived` ficam fora da listagem padrão na IA mas preservam histórico
+para relatórios. Se preferir hard-delete, use `DELETE /items/totvs/{externalId}`.
+
+## Erros comuns
+
+| Sintoma | Causa provável | Fix |
+|---|---|---|
+| 400 `validation_error: gtin13` | EAN com espaço/dígitos errados | Sanitize: `r.ean?.replace(/\D/g,'').padStart(13,'0')` |
+| 409 `conflict` em SKU | 2 produtos no ERP com mesmo SKU | Reportar ao usuário, manual fix no ERP |
+| Imagens não aparecem | URL com auth token expirando | Hospede em CDN público (Cloudflare R2, S3 público) |
+| `media.ingestion_failed` em todas | CDN bloqueando User-Agent `Voop-Webhooks/1.0` | Whitelist IP (contate Voop) ou troque CDN |

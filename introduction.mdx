@@ -1,0 +1,71 @@
+---
+title: "Introdução"
+description: "Voop Catalog API — sincronize seu catálogo de produtos via REST"
+---
+
+A **Voop Catalog API** permite que você integre sua plataforma de e-commerce, ERP ou
+sistema próprio diretamente ao catálogo da Voop. Mantenha seus produtos sincronizados
+automaticamente — incluindo cargas iniciais de **100 mil+ produtos com imagens**.
+
+## O que você consegue fazer
+
+<CardGroup cols={2}>
+  <Card title="Upsert idempotente" icon="arrows-rotate" href="/api-reference/items/upsert">
+    Cada produto identificado por `(externalSystem, externalId)` — sem se preocupar com
+    IDs internos da Voop.
+  </Card>
+  <Card title="Bulk import 100k+" icon="file-arrow-up" href="/api-reference/imports/initiate">
+    Upload de JSONL (até 100MB) com processamento assíncrono e relatório de erros por linha.
+  </Card>
+  <Card title="Imagens por URL" icon="image" href="/concepts/media">
+    Cliente envia URLs; a Voop baixa de forma assíncrona com cache via ETag.
+  </Card>
+  <Card title="Webhooks outbound" icon="bell" href="/concepts/webhooks">
+    Receba eventos em tempo real quando produtos/estoque mudam, com assinatura HMAC.
+  </Card>
+</CardGroup>
+
+## Por que essa API existe
+
+O catálogo da Voop é **agnóstico**: ele alimenta IA conversacional, perfis digitais públicos,
+helpdesk com cards de produto, e mais — tudo sem que o catálogo precise saber desses módulos.
+
+Isso significa que **você gerencia os produtos no seu sistema**, e a Voop vira o hub para
+todos os usos downstream. Sem duplicação manual, sem divergência.
+
+## Princípios
+
+<Steps>
+  <Step title="Idempotência por externalId">
+    Re-enviar o mesmo payload **não cria duplicatas** e **não gera writes** se nada mudou.
+    O backend mantém um `contentHash` interno para detectar mudanças reais.
+  </Step>
+  <Step title="Mídia depois do produto">
+    Itens ficam disponíveis imediatamente para a IA e demais módulos. Imagens chegam em
+    background e são deduplicadas globalmente por `fileHash`.
+  </Step>
+  <Step title="Falha visível, nunca silenciosa">
+    Erros de validação, conflitos e falhas de ingest aparecem na resposta da API e no
+    dashboard. Webhooks de `import.failed` / `media.ingestion_failed` notificam você.
+  </Step>
+  <Step title="API versionada desde o dia 1">
+    O contrato `/api/v1/...` tem garantia de não-breaking change dentro da mesma versão.
+  </Step>
+</Steps>
+
+## Próximos passos
+
+<CardGroup cols={2}>
+  <Card title="Autenticação" icon="key" href="/authentication">
+    Crie sua primeira API key no Developer Portal.
+  </Card>
+  <Card title="Idempotência" icon="repeat" href="/idempotency">
+    Entenda como funciona o `contentHash` — base do upsert.
+  </Card>
+  <Card title="Carga inicial 100k" icon="rocket" href="/recipes/initial-load-100k">
+    Receita completa de migração inicial de catálogo grande.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api-reference/introduction">
+    Toda a referência interativa — gerada da spec OpenAPI.
+  </Card>
+</CardGroup>

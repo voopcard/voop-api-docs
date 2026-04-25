@@ -1,0 +1,157 @@
+---
+title: "Receber webhooks com segurança"
+description: "Servidor Node.js de exemplo com verificação HMAC e idempotência"
+---
+
+Este é um exemplo completo de servidor Node.js que recebe webhooks da Voop com:
+
+- Verificação HMAC SHA-256
+- Replay protection (timestamp 5 min)
+- Timing-safe compare
+- Idempotência via `X-Voop-Event-Id` (Redis)
+
+```js
+import express from 'express';
+import { createHmac, timingSafeEqual } from 'crypto';
+import Redis from 'ioredis';
+
+const app = express();
+const redis = new Redis(process.env.REDIS_URL);
+const SECRET = process.env.VOOP_WEBHOOK_SECRET; // do dashboard
+
+// IMPORTANTE: rawBody é necessário para verificar HMAC
+app.use((req, _res, next) => {
+  let data = '';
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => (data += chunk));
+  req.on('end', () => {
+    req.rawBody = data;
+    try {
+      req.body = JSON.parse(data);
+    } catch {
+      req.body = null;
+    }
+    next();
+  });
+});
+
+function verifySignature(req) {
+  const header = req.headers['x-voop-signature'];
+  if (!header) throw new Error('Missing signature header');
+
+  const parts = Object.fromEntries(
+    header.split(',').map((p) => p.split('=')),
+  );
+  const timestamp = parseInt(parts.t, 10);
+  const provided = parts.v1;
+
+  // Replay protection: 5 min
+  if (Math.abs(Date.now() / 1000 - timestamp) > 300) {
+    throw new Error('Timestamp too old or in future');
+  }
+
+  const expected = createHmac('sha256', SECRET)
+    .update(`${timestamp}.${req.rawBody}`)
+    .digest('hex');
+
+  if (provided.length !== expected.length) {
+    throw new Error('Signature length mismatch');
+  }
+  if (!timingSafeEqual(Buffer.from(provided, 'hex'), Buffer.from(expected, 'hex'))) {
+    throw new Error('Invalid signature');
+  }
+}
+
+async function ensureNotProcessed(eventId) {
+  const key = `voop:webhook:seen:${eventId}`;
+  // SETNX retorna 1 se foi setado (não existia), 0 se já existia
+  const result = await redis.set(key, '1', 'EX', 7 * 24 * 60 * 60, 'NX');
+  if (result === null) {
+    console.log(`Skip duplicate event ${eventId}`);
+    return false;
+  }
+  return true;
+}
+
+app.post('/voop/webhook', async (req, res) => {
+  try {
+    verifySignature(req);
+  } catch (err) {
+    console.warn('Signature verification failed:', err.message);
+    return res.status(401).json({ error: err.message });
+  }
+
+  const eventId = req.headers['x-voop-event-id'];
+  if (!(await ensureNotProcessed(eventId))) {
+    return res.json({ skipped: 'duplicate' });
+  }
+
+  const { type, data } = req.body;
+
+  // Despachar por tipo
+  switch (type) {
+    case 'item.created':
+    case 'item.updated':
+      console.log(`Item ${data.externalId} → ${type}`);
+      // sua lógica aqui
+      break;
+
+    case 'item.deleted':
+      console.log(`Deleted ${data.externalId}`);
+      break;
+
+    case 'stock.adjusted':
+      console.log(`Stock change on ${data.itemId}: ${data.quantity} (total now ${data.totalStock})`);
+      break;
+
+    case 'media.ingested':
+      console.log(`Media ${data.sourceUrl} stored as asset ${data.assetId}`);
+      break;
+
+    case 'media.ingestion_failed':
+      console.error(`Media FAILED ${data.sourceUrl}: ${data.error}`);
+      // alertar time de catálogo
+      break;
+
+    case 'import.completed':
+      console.log(`Import ${data.jobId} → ${data.status}`, data.counts);
+      break;
+
+    default:
+      console.log(`Unknown event: ${type}`);
+  }
+
+  // ✅ SEMPRE responda 2xx em < 5s. Processamento pesado vai para fila.
+  res.json({ received: true });
+});
+
+app.listen(3000, () => console.log('Voop webhook listener on :3000'));
+```
+
+## Por que `rawBody`?
+
+A assinatura HMAC é calculada sobre o **JSON raw**. Se você fizer `JSON.parse` e
+depois `JSON.stringify`, a string resultante pode diferir minimamente
+(ordem de chaves, espaçamento) e quebrar a verificação.
+
+A solução acima captura `rawBody` em um middleware **antes** do parse — o
+`req.body` continua disponível para sua lógica.
+
+Se você usa `express.json()` direto, troque por `express.raw({ type: 'application/json' })`
+**só na rota do webhook** e parseie manualmente.
+
+## Por que processar em fila?
+
+A Voop dá timeout de **5 segundos**. Se sua lógica de processamento pode demorar
+(ex: invalidar cache, sincronizar em outros sistemas), faça **só o mínimo** no
+handler HTTP (verificar + persistir o evento numa fila local) e responda 2xx.
+Worker em background processa.
+
+```js
+case 'item.updated':
+  await myQueue.add('voop-item-updated', data); // BullMQ, SQS, etc.
+  break;
+```
+
+Caso contrário, você corre risco de timeout, e a Voop retenta — gerando
+processamento duplicado.

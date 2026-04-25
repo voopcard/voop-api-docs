@@ -1,0 +1,137 @@
+---
+title: "Webhooks"
+description: "Eventos outbound, assinatura HMAC, retries e auto-disable"
+---
+
+Webhooks permitem que a Voop **notifique seu sistema em tempo real** quando algo
+muda no catálogo. Use-os para sincronização bidirecional, dashboards de auditoria,
+ou triggers de fluxos internos.
+
+## Eventos disponíveis
+
+| Evento | Disparado quando |
+|---|---|
+| `item.created` | Novo item criado via API |
+| `item.updated` | Item existente alterado (contentHash mudou) |
+| `item.deleted` | Item removido |
+| `variant.created` / `.updated` / `.deleted` | Variantes (futuro) |
+| `stock.adjusted` | Movimento de estoque registrado |
+| `media.ingested` | Imagem baixada com sucesso |
+| `media.ingestion_failed` | Imagem falhou após retries |
+| `import.completed` | Bulk import finalizou (com ou sem erros) |
+| `import.failed` | Bulk import abortou |
+
+Use `"*"` no array `events` para subscrever todos.
+
+## Formato do payload
+
+```http
+POST https://seu-servidor.com/webhook
+Content-Type: application/json
+X-Voop-Signature: t=1714000000,v1=a1b2c3...
+X-Voop-Event-Type: item.created
+X-Voop-Event-Id: 01HXYZ...
+User-Agent: Voop-Webhooks/1.0
+
+{
+  "id": "01HXYZ...",
+  "type": "item.created",
+  "catalogId": "catalog-uuid",
+  "resourceId": "PROD-123",
+  "createdAt": "2026-04-25T12:34:56.789Z",
+  "data": {
+    "externalId": "PROD-123",
+    "externalSystem": "shopify",
+    "voopId": "uuid-internal",
+    "sku": "ABC-001"
+  }
+}
+```
+
+## Verificação da assinatura
+
+A assinatura usa **HMAC SHA-256** com timestamp para prevenir replay.
+
+```
+header   = "t={timestamp},v1={hex_signature}"
+payload  = `${timestamp}.${rawBody}`
+signature = HMAC-SHA256(secret, payload)
+```
+
+### Exemplo (Node.js)
+
+```js
+import crypto from 'crypto';
+
+function verifyVoopWebhook(req, secret) {
+  const header = req.headers['x-voop-signature'];
+  const [tPart, v1Part] = header.split(',');
+  const timestamp = parseInt(tPart.split('=')[1], 10);
+  const provided = v1Part.split('=')[1];
+
+  // Replay protection: rejeitar se timestamp > 5 minutos
+  if (Math.abs(Date.now() / 1000 - timestamp) > 300) {
+    throw new Error('Webhook timestamp too old');
+  }
+
+  const rawBody = req.rawBody; // bytes brutos, antes do JSON.parse
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(`${timestamp}.${rawBody}`)
+    .digest('hex');
+
+  // timing-safe compare!
+  if (!crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
+    throw new Error('Invalid signature');
+  }
+}
+```
+
+<Warning>
+  **Sempre** use `timingSafeEqual` (ou equivalente). Comparação de strings comum
+  vaza tempo e permite ataques de timing.
+</Warning>
+
+<Warning>
+  **Use o body raw**, não o JSON re-serializado. Frameworks como Express com
+  `express.json()` perdem o body original — você precisa de `express.raw()` ou
+  capturar `rawBody` antes do middleware de JSON.
+</Warning>
+
+## Retries e backoff
+
+Se sua URL não retornar `2xx` em 5 segundos, a Voop retenta:
+
+```
+attempt 1  →  imediato
+attempt 2  →  ~5s
+attempt 3  →  ~25s
+attempt 4  →  ~2min
+attempt 5  →  ~10min
+attempt 6  →  ~30min
+attempt 7  →  ~2h
+attempt 8  →  ~6h
+após 8     →  status="exhausted"
+```
+
+## Auto-disable
+
+Se um webhook acumula **20 falhas terminais consecutivas** (i.e., `exhausted`),
+ele é automaticamente desabilitado (`status: disabled`) e o owner recebe email.
+
+Para reativar: `POST /webhooks/{id}/resume` (após corrigir o problema). Ou pelo
+Developer Portal.
+
+## Idempotência no consumidor
+
+A Voop pode entregar o **mesmo evento mais de uma vez** (em cenários de timeout
+seguido de sucesso na próxima tentativa). Sua implementação deve ser idempotente:
+
+- Use o `X-Voop-Event-Id` (UUID) como chave de dedup
+- Guarde IDs vistos por algum tempo (ex: Redis TTL 7 dias)
+- Skip se já processado
+
+## Replay manual
+
+Falhou uma entrega importante? `POST /webhooks/{id}/deliveries/{deliveryId}/retry`
+re-enfileira a mesma entrega. (Disponível também na UI do Developer Portal.)

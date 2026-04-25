@@ -1,0 +1,85 @@
+---
+title: "Items"
+description: "Estrutura, campos canônicos, e resolução de category/brand"
+---
+
+Um **Item** representa um produto, serviço, item digital ou bundle no seu catálogo.
+
+## Tipos de item
+
+| `itemType` | Uso | Campos relevantes |
+|---|---|---|
+| `product` | Produto físico | weight, dimensões, GTIN, NCM, stock |
+| `service` | Serviço | `pricingModel` (`hourly`, `per_session`, etc.), `serviceCode` |
+| `digital` | Item digital (e-book, license) | sem peso/dimensão; ainda pode ter stock (limite de licenças) |
+| `bundle` | Pacote de items | reservado, ainda não totalmente suportado |
+
+## Campos de identificação
+
+Os códigos brasileiros e internacionais são suportados nativamente:
+
+- **`sku`** (obrigatório, único por catálogo): seu SKU interno, mutável
+- **`itemCode`**: código próprio da empresa (ex: código antigo de ERP)
+- **`gtin13`**: EAN-13 (padrão Brasil)
+- **`gtin12`**: UPC (padrão EUA legado)
+- **`gtin14`**: GTIN de unidade logística (caixa)
+- **`mpn`**: Manufacturer Part Number
+- **`ncm`**: Nomenclatura Comum do Mercosul (8 dígitos)
+- **`cest`**: Código Especificador de ST (7 dígitos)
+- **`serviceCode`**: LC 116/2003, para NFS-e (Nota de Serviço)
+
+## Resolução de category e brand
+
+Você não precisa conhecer os UUIDs internos da Voop. Envie por **slug** ou **name**:
+
+```json
+{
+  "category": { "slug": "eletronicos" },
+  "brand":    { "name": "Voop Industries" }
+}
+```
+
+Comportamento:
+
+- Se a category com `slug` existe → reusa
+- Se não existe mas `name` foi enviado → **cria silenciosamente**
+- Se a brand com `name` existe → reusa
+- Se não existe → cria
+
+<Tip>
+  Para catálogos grandes, declare suas categorias/brands antecipadamente no dashboard
+  para garantir slugs consistentes. A criação automática usa `slugify(name)` se não for explícito.
+</Tip>
+
+## Mídia
+
+```json
+{
+  "media": [
+    { "url": "https://cdn.cliente.com/img/main.jpg", "role": "primary" },
+    { "url": "https://cdn.cliente.com/img/2.jpg",    "role": "gallery", "sortOrder": 1 },
+    { "url": "https://cdn.cliente.com/img/3.jpg",    "role": "gallery", "sortOrder": 2 }
+  ]
+}
+```
+
+Roles disponíveis: `primary`, `gallery`, `thumbnail`, `swatch`, `manual`, `spec_sheet`, `certificate`, `other`.
+
+Veja o guia [Mídia](/concepts/media) para detalhes do pipeline de ingestão assíncrona.
+
+## Metadata extensível
+
+Use o campo `metadata` (JSON livre) para informações que não cabem nos campos padrão:
+
+```json
+{
+  "metadata": {
+    "warranty_months": 24,
+    "country_of_origin": "BR",
+    "supplier_id": "SUP-789",
+    "custom_attributes": { "voltage": "127V" }
+  }
+}
+```
+
+Esse JSON é preservado fielmente e disponível downstream (IA, perfis públicos).

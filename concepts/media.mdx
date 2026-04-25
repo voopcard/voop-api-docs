@@ -1,0 +1,119 @@
+---
+title: "Mídia"
+description: "Pipeline assíncrono de ingestão de imagens — URL → R2 com dedup global"
+---
+
+Imagens **não são enviadas inline** na API. Você manda **URLs** e a Voop baixa de
+forma assíncrona. Isso permite cargas de 100k+ produtos sem timeout, sem upload
+manual, e com dedup global.
+
+## Lifecycle de uma URL
+
+```
+                 ┌────────────────────────────────────────────────┐
+ cliente:        │ POST /items/upsert                              │
+ envia URLs   ──▶│ media: [{ url: "https://...", role: "primary" }]│
+                 └────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                 ┌────────────────────────────────────────────────┐
+                 │ CatalogMediaSource: status=pending             │
+                 │ (dedup por URL normalizada)                     │
+                 └────────────────────────────────────────────────┘
+                                      │
+                                      ▼ (BullMQ job)
+                 ┌────────────────────────────────────────────────┐
+                 │ catalogMediaIngestWorker                       │
+                 │  1. HEAD com If-None-Match (ETag dedup)        │
+                 │  2. Per-domain semaphore (10 simultâneos)      │
+                 │  3. GET streaming → R2 (sem buffer em RAM)     │
+                 │  4. SHA-256 hash em paralelo                   │
+                 └────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                 ┌────────────────────────────────────────────────┐
+                 │ MediaAsset criado em R2 (com replicação GCS)   │
+                 │ ProductMedia rows materializados (item ↔ asset) │
+                 └────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+                 ┌────────────────────────────────────────────────┐
+                 │ Webhook: media.ingested                        │
+                 └────────────────────────────────────────────────┘
+```
+
+## Dedup duplo
+
+### 1. Por URL normalizada
+
+A mesma URL usada em **N produtos** = **1 download**, **1 asset**, **N referências**.
+
+Antes de hashear, a URL é normalizada:
+- Host em lowercase
+- Fragment removido (`#section`)
+- Query params ordenados alfabeticamente
+- Tracking params removidos (`utm_*`, `v`, `t`, `ref`, `fbclid`, `gclid`)
+
+Resultado: `https://CDN.X.com/img.jpg?utm=x&keep=y` e `https://cdn.x.com/img.jpg?keep=y` são tratadas como **a mesma fonte**.
+
+### 2. Por ETag (HTTP)
+
+Antes de re-baixar, a Voop faz `HEAD` com `If-None-Match`:
+- `304 Not Modified` → status `skipped_unchanged`, zero custo
+- `200 OK` → re-baixa apenas se conteúdo mudou
+
+## Validação automática
+
+Antes do download, a Voop verifica:
+
+| Check | Limite | Status quando falha |
+|---|---|---|
+| `Content-Length` | 50 MB | `skipped_oversized` |
+| `Content-Type` | image/* (não SVG) | `skipped_invalid_type` |
+
+SVG é bloqueado por risco de XSS quando renderizado em navegadores.
+
+## Per-domain rate limit
+
+Para não sobrecarregar o servidor de origem do **cliente**, a Voop limita a
+**10 downloads simultâneos por domínio**. Subdomínios são pools separados:
+`cdn.example.com` e `assets.example.com` têm 10 slots cada.
+
+<Tip>
+  Se seu CDN tem rate limit próprio (ex: Cloudflare Free com 100 req/s), considere
+  hospedar imagens em um subdomínio dedicado para que outros clientes da Voop não
+  compitam pelo mesmo pool com você.
+</Tip>
+
+## Status de uma source
+
+```
+pending             — registrada, aguardando worker
+fetching            — em download
+stored              — sucesso, asset criado
+failed              — erro (4xx, 5xx, timeout)
+skipped_unchanged   — ETag bate, sem mudança
+skipped_oversized   — > 50 MB
+skipped_invalid_type — tipo não suportado
+```
+
+Você pode consultar o status de cada item em `GET /items/{externalSystem}/{externalId}` —
+o array `media` retorna o estado atual.
+
+## Webhooks de mídia
+
+```
+media.ingested            — sucesso após download
+media.ingestion_failed    — falha após attempts esgotados
+```
+
+Use esses webhooks para reagir a falhas no seu pipeline (ex: notificar o time de
+catálogo que uma imagem está quebrada).
+
+## Re-tentativa manual
+
+Se uma source ficou `failed` por motivo transitório (CDN do cliente caiu por 1h),
+o worker tenta automaticamente até **5 vezes** com backoff exponencial (30s, 60s, 2min, 4min, 8min).
+
+Após esgotado, você pode disparar re-ingest fazendo um upsert do mesmo item com
+a mesma URL — o backend re-enfileira automaticamente se o status for não-terminal.

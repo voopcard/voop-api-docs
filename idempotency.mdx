@@ -1,0 +1,75 @@
+---
+title: "Idempotência"
+description: "Como upsert por externalId funciona — contentHash, unchanged, dedup de mídia"
+---
+
+A pedra angular da Voop Catalog API é a **idempotência por `externalId`**. Reenviar
+o mesmo payload **não cria duplicatas** e **não consome writes** se nada mudou.
+
+## A unique key
+
+```
+(catalogId, externalSystem, externalId)
+```
+
+- `catalogId` é resolvido implicitamente pela API key (cada chave pertence a 1 catálogo)
+- `externalSystem` identifica a origem (ex: `"shopify"`, `"totvs"`, `"meu-erp"`)
+- `externalId` é o ID **do seu sistema** (SKU, ID do Shopify, ID de produto interno)
+
+A Voop guarda esse triplete em `ExternalProductSync` e mapeia para o `voopId` interno.
+Você nunca precisa saber o `voopId` — basta seu `externalId`.
+
+## O contentHash
+
+Cada upsert calcula um `contentHash` SHA-256 sobre os campos canônicos do payload
+(SKU, nome, preço, dimensões, mídia, etc., normalizados).
+
+```
+hash atual === hash armazenado  →  outcome: "unchanged"  (zero writes)
+hash atual !== hash armazenado  →  outcome: "updated"
+não existe                       →  outcome: "created"
+```
+
+## Por que isso importa
+
+<CardGroup cols={2}>
+  <Card title="Re-sync seguro" icon="rotate">
+    Pode rodar `bulk-upsert` do catálogo inteiro **toda noite** sem custo extra. A
+    Voop processa apenas o que mudou.
+  </Card>
+  <Card title="Recuperação de falha" icon="shield">
+    Se o cliente cair durante um sync, basta rodar de novo. Itens já enviados retornam
+    `unchanged`; novos são processados.
+  </Card>
+  <Card title="Webhook reentrante" icon="arrows-rotate">
+    Se você recebe webhook do Shopify e a Voop não responde a tempo, o Shopify retenta —
+    sem efeito colateral.
+  </Card>
+  <Card title="Mídia preservada" icon="image">
+    `unchanged` não re-baixa as imagens. Só URLs novas/alteradas entram na fila de ingest.
+  </Card>
+</CardGroup>
+
+## Mídia: dedup duplo
+
+Imagens são deduplicadas em duas dimensões:
+
+1. **Por URL normalizada** (`CatalogMediaSource.sourceUrlHash`):
+   - Mesma URL usada em 100 produtos = 1 download, 1 asset, 100 referências
+   - Tracking params (`utm_*`, `fbclid`, `gclid`) são removidos antes do hash
+   - Query params são ordenados — `?a=1&b=2` e `?b=2&a=1` são iguais
+
+2. **Por ETag (HTTP)** (`CatalogMediaSource.etag`):
+   - Antes de re-baixar, a Voop faz `HEAD` com `If-None-Match`
+   - 304 → skip (zero download, zero storage cost)
+   - 200 → re-baixa só se conteúdo mudou
+
+## Quando NÃO é idempotente
+
+Os endpoints abaixo **modificam estado independente do payload**:
+
+- `POST /imports` — sempre cria um novo job
+- `POST /webhooks` — sempre cria um novo webhook (com novo secret)
+- `DELETE /items/:externalSystem/:externalId` — uma deleção é ação destrutiva
+
+Para esses, o cliente **não deve retentar** automaticamente sem checar o estado primeiro.

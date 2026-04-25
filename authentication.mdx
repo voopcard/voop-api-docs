@@ -1,0 +1,88 @@
+---
+title: "Autenticação"
+description: "API keys, escopos e ambientes (live / test)"
+---
+
+A Voop Catalog API usa **API keys de longa duração** com escopos explícitos por chave.
+
+## Formato
+
+```
+vpk_live_a1b2c3d4e5f67890a1b2c3d4e5f67890
+^^^ ^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ │   │              │
+ │   │              └─ 32 hex chars (128 bits de entropia)
+ │   └──────────────── ambiente (live | test)
+ └──────────────────── prefixo Voop ("voop public key")
+```
+
+Os primeiros 8 caracteres do segredo (após `vpk_<env>_`) ficam visíveis no dashboard
+para identificação — ex: `vpk_live_a1b2c3d4`. O restante nunca é exibido novamente
+após a criação.
+
+## Como usar
+
+Envie a chave no header `Authorization` em **toda** requisição:
+
+```bash
+curl -X POST https://api.voop.work/api/v1/catalog/items/upsert \
+  -H "Authorization: Bearer vpk_live_a1b2c3d4e5f67890a1b2c3d4e5f67890" \
+  -H "Content-Type: application/json" \
+  -d '{ "externalSystem": "shopify", "externalId": "PROD-1", "sku": "ABC", "name": "X", "price": 99.9 }'
+```
+
+Para retro-compatibilidade, o header `X-API-Key` também é aceito — mas `Authorization: Bearer`
+é o padrão recomendado.
+
+## Escopos
+
+Cada chave declara um conjunto de **escopos** no momento da criação. Sem o escopo certo,
+a request é rejeitada com `403 Forbidden`.
+
+| Escopo | Permite |
+|---|---|
+| `catalog:read` | Listar e buscar items, ler webhooks |
+| `catalog:write` | Upsert e delete de items |
+| `stock:write` | Ajustes de estoque (Phase futura) |
+| `webhook:manage` | Criar, pausar, deletar webhooks |
+| `bulk_import:manage` | Iniciar e gerenciar bulk imports |
+
+<Tip>
+  Princípio do **menor privilégio**: crie chaves separadas para cada workload. Por
+  exemplo, uma chave `catalog:write` para o sync diário e outra `catalog:read` para
+  health checks ou dashboards de BI.
+</Tip>
+
+## Ambientes: `live` vs `test`
+
+- `vpk_live_*` — produção. Mudanças refletem no catálogo real.
+- `vpk_test_*` — sandbox. Útil para CI e desenvolvimento. Reservado; ativação por solicitação.
+
+## Rotação de chaves
+
+1. Crie uma nova chave no Developer Portal
+2. Atualize o sistema cliente para usar a nova chave
+3. Confirme que tudo continua funcionando
+4. Revogue a chave antiga (botão **Revoke** no portal)
+
+Após `revoke`, a chave deixa de autenticar imediatamente (cache Redis tem TTL máximo de 120s).
+
+## Segurança
+
+<Warning>
+  Trate API keys como **senhas**. Nunca commite em código-fonte. Use variáveis de
+  ambiente ou um secret manager (HashiCorp Vault, AWS Secrets Manager, GCP Secret
+  Manager, etc.).
+</Warning>
+
+A chave é armazenada no banco como **SHA-256 hash** — mesmo um vazamento do banco
+não revela o segredo cleartext. Mas se o segredo vazou em outro lugar (logs, repo
+público), revogue **imediatamente**.
+
+## Códigos de erro de auth
+
+| Status | Código | Causa |
+|---|---|---|
+| 401 | `unauthorized` | Header ausente, chave inválida, chave revogada |
+| 403 | `forbidden` | Chave válida mas sem o scope necessário |
+| 429 | `too_many_requests` | Rate limit do tier excedido |

@@ -1,0 +1,73 @@
+---
+title: "Rate Limits"
+description: "Tiers, headers de resposta e estratégia de retry"
+---
+
+A API aplica rate limit **por API key** com tiers configuráveis.
+
+## Limites por tier
+
+| Tier | Requests/minuto |
+|---|---|
+| `free` (default) | 100 |
+| `pro` | 1.000 |
+| `enterprise` | 10.000 |
+
+Para mudar o tier de uma chave, contate o time da Voop.
+
+## Headers de resposta
+
+Toda resposta inclui:
+
+```
+X-RateLimit-Limit:     1000
+X-RateLimit-Remaining: 998
+X-RateLimit-Reset:     1714000060   (unix timestamp seconds)
+```
+
+Quando o limite é excedido, a resposta é `429 Too Many Requests` com:
+
+```
+Retry-After: 47   (seconds)
+```
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "too_many_requests",
+    "message": "Catalog API rate limit exceeded. Upgrade your tier for higher limits.",
+    "retryAfter": 47
+  }
+}
+```
+
+## Estratégia recomendada
+
+<Steps>
+  <Step title="Respeite Retry-After">
+    Aguarde **pelo menos** o valor de `Retry-After` antes de retentar. Re-tentar
+    imediatamente pode te colocar em backoff exponencial mais agressivo.
+  </Step>
+  <Step title="Backoff exponencial com jitter">
+    Para erros 5xx ou 429 sem `Retry-After`, use `backoff = min(2^attempt, 60s) ± jitter`.
+    Sem jitter, você cria thundering herd com outros clientes.
+  </Step>
+  <Step title="Monitore X-RateLimit-Remaining">
+    Se cair abaixo de 10% do `Limit`, considere desacelerar proativamente.
+  </Step>
+  <Step title="Use bulk-upsert para reduzir consumo">
+    1 chamada de `bulk-upsert` com 500 items = 1 request. 500 chamadas de `upsert` = 500 requests.
+  </Step>
+</Steps>
+
+## Bulk imports não consomem rate limit
+
+Os endpoints `POST /imports`, `POST /imports/:id/start`, `GET /imports/:id` consomem
+o rate limit normal — mas o **processamento dos itens dentro do JSONL não conta**.
+Você pode importar 100k itens com 4 requests.
+
+<Tip>
+  Para carga inicial grande, **sempre** use `POST /imports` (assíncrono via JSONL),
+  não `POST /items/bulk-upsert` em loop.
+</Tip>

@@ -1,0 +1,147 @@
+---
+title: "Bulk Import"
+description: "JSONL streaming para cargas de 100k+ itens"
+---
+
+Para cargas grandes (carga inicial, migração, sync diário pesado), use o pipeline
+**assíncrono** de bulk import. Limites:
+
+- Arquivo até **100 MB** (alinhado com Shopify)
+- Formato **JSONL** (uma linha por item, mesmo schema do `POST /items/upsert`)
+- Até **5 jobs simultâneos** por catálogo
+
+## Fluxo completo
+
+<Steps>
+  <Step title="POST /imports — cria job + signed URL">
+    A Voop responde com `jobId` + `uploadUrl`. A URL é assinada e válida por 1 hora.
+
+    ```bash
+    curl -X POST https://api.voop.work/api/v1/catalog/imports \
+      -H "Authorization: Bearer vpk_live_..." \
+      -H "Content-Type: application/json" \
+      -d '{ "fileSizeBytes": 12345678 }'
+    ```
+
+    ```json
+    {
+      "success": true,
+      "data": {
+        "jobId": "01HXYZ...",
+        "uploadUrl": "https://r2.cloudflarestorage.com/...",
+        "storagePath": "companies/.../bulk-imports/...",
+        "expiresIn": 3600,
+        "uploadMethod": "PUT",
+        "contentType": "application/x-ndjson"
+      }
+    }
+    ```
+  </Step>
+
+  <Step title="PUT {uploadUrl} — upload do JSONL para R2">
+    Faça **PUT** direto na uploadUrl. Não passa pela API da Voop — vai direto
+    para o R2 (sem custo de banda intermediária).
+
+    ```bash
+    curl -X PUT "$UPLOAD_URL" \
+      -H "Content-Type: application/x-ndjson" \
+      --data-binary @catalog.jsonl
+    ```
+
+    Cada linha do `catalog.jsonl` é o payload de `POST /items/upsert`:
+
+    ```jsonl
+    {"externalSystem":"shopify","externalId":"P1","sku":"S1","name":"Item 1","price":99.9}
+    {"externalSystem":"shopify","externalId":"P2","sku":"S2","name":"Item 2","price":49.9}
+    {"externalSystem":"shopify","externalId":"P3","sku":"S3","name":"Item 3","price":29.9}
+    ```
+  </Step>
+
+  <Step title="POST /imports/{jobId}/start — enfileira para processar">
+    ```bash
+    curl -X POST https://api.voop.work/api/v1/catalog/imports/$JOB_ID/start \
+      -H "Authorization: Bearer vpk_live_..."
+    ```
+
+    O backend abre stream do R2, lê linha-a-linha, valida com Zod, e faz upsert
+    em batches transacionais de 100. Erros isolados não param o batch.
+  </Step>
+
+  <Step title="GET /imports/{jobId} — pollingdo status">
+    ```json
+    {
+      "id": "01HXYZ...",
+      "status": "processing",
+      "progress": 45,
+      "counts": {
+        "total": 4523,
+        "processed": 4523,
+        "succeeded": 4400,
+        "failed": 23,
+        "unchanged": 100
+      },
+      "errorCount": 23,
+      "fileSizeBytes": 12345678,
+      "createdAt": "...",
+      "startedAt": "...",
+      "finishedAt": null
+    }
+    ```
+
+    Quando `status` for terminal (`completed`, `completed_with_errors`, `failed`,
+    `cancelled`), o `import.completed` ou `import.failed` webhook é disparado.
+  </Step>
+
+  <Step title="GET /imports/{jobId}/errors — erros por linha">
+    Ao final, se `errorCount > 0`, baixe a lista de erros (paginada):
+
+    ```json
+    {
+      "errors": [
+        {
+          "lineNumber": 1234,
+          "externalId": "PROD-123",
+          "errorType": "validation",
+          "errorMessage": "items.0.gtin13: GTIN-13 deve ter 13 dígitos",
+          "rawLine": "{\"externalId\":\"PROD-123\",...}"
+        }
+      ]
+    }
+    ```
+
+    Filtre por `errorType` (`validation`, `database`, `conflict`, `reference`).
+  </Step>
+</Steps>
+
+## Por que JSONL?
+
+- **Streamable**: o backend lê linha-a-linha sem carregar 100MB em memória
+- **Tolerante**: linha mal-formatada não corrompe o resto do arquivo
+- **Padrão**: usado pelo Shopify, BigQuery, AWS Athena, etc.
+- **Diff-friendly**: se você gera o arquivo deterministicamente, pode usar `diff` entre rodadas
+
+## Recomendações de geração
+
+- Use UTF-8, terminadores `\n` (não `\r\n`)
+- 1 produto por linha — sem indentação
+- Linhas vazias são ignoradas (tolerante)
+- **Não** envolva em array JSON: o arquivo NÃO é `[{...}, {...}]`, é `{...}\n{...}`
+
+## Exemplo Node.js de geração
+
+```js
+import { createWriteStream } from 'fs';
+
+const stream = createWriteStream('catalog.jsonl');
+for (const product of allProducts) {
+  stream.write(JSON.stringify({
+    externalSystem: 'meu-erp',
+    externalId: product.id,
+    sku: product.sku,
+    name: product.name,
+    price: product.price,
+    media: product.images.map(img => ({ url: img.url, role: 'gallery' })),
+  }) + '\n');
+}
+stream.end();
+```
